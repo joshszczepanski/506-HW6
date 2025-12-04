@@ -4,26 +4,523 @@ output: html_document
 date: "2025-12-04"
 ---
 
-```{r setup, include=FALSE}
-#InitialPush
+```{r}
+library(Rcpp)
+library(e1071)
+library(knitr)
+# --------------------------------------------------
+# C++: Compute the mean (template from notes)
+# --------------------------------------------------
+cppFunction('
+  double C_mean(NumericVector x) {
+    int n = x.size();
+    double sum = 0.0;
+    for(int i = 0; i < n; i++){
+      sum += x[i];
+    }
+    return sum / n;
+  }
+')
+
+# --------------------------------------------------
+# C++: kth central moment
+#   Returns: mean( (x - mean(x))^k )
+#   Matches e1071::moment(..., center = TRUE, absolute = FALSE)
+# --------------------------------------------------
+cppFunction('
+  double C_moment(NumericVector x, int k) {
+    int n = x.size();
+    
+    // Compute mean directly inside this function
+    double mu = 0.0;
+    for(int i = 0; i < n; i++){
+      mu += x[i];
+    }
+    mu /= n;
+
+    // Accumulate central moment
+    double acc = 0.0;
+    for(int i = 0; i < n; i++){
+      double diff = x[i] - mu;
+      acc += pow(diff, k);
+    }
+
+    return acc / n;   // divide by n to match e1071::moment()
+  }
+')
+
+set.seed(2025)
+x <- rnorm(1000)   # "moderate" length vector
+
+# Compare 2nd, 3rd, 4th central moments
+results <- vapply(2:4, function(k) {
+  c(
+    k = as.numeric(k),
+    C_moment = C_moment(x, k),
+    e1071_moment = moment(x, order = k, center = TRUE)
+  )
+}, numeric(3))
+
+knitr::kable(t(results), digits = 6, col.names = c("Order", "C_moment", "e1071::moment"))
+
+all.equal(
+  C_moment(x, 3),
+  moment(x, order = 3, center = TRUE)
+)
+
 ```
 
-## R Markdown
+```{r}
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+############################################################
+# Problem 2 — Expanding on waldCI
+############################################################
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+library(parallel)
 
-```{r cars}
-summary(cars)
+
+############################################################
+# 1. Parent Class: waldCI
+############################################################
+
+setClass(
+  "waldCI",
+  slots = list(
+    est   = "numeric",
+    sterr = "numeric",
+    level = "numeric"
+  )
+)
+
+setMethod("show", "waldCI", function(object) {
+  alpha <- 1 - object@level
+  z <- qnorm(1 - alpha/2)
+
+  cat("Wald CI:\n")
+  cat("  Estimate:", object@est, "\n")
+  cat("  SE:", object@sterr, "\n")
+  cat("  Level:", object@level, "\n")
+  cat("  CI:", object@est - z*object@sterr, "to",
+                 object@est + z*object@sterr, "\n\n")
+})
+
+
+############################################################
+# 2. Child Class: bootstrapWaldCI
+#    (inherits from waldCI)
+############################################################
+
+setClass(
+  "bootstrapWaldCI",
+  contains = "waldCI",
+  slots = list(
+    fun     = "function",
+    data    = "ANY",
+    reps    = "numeric",
+    compute = "character",
+    boots   = "numeric"   # store bootstrap draws
+  )
+)
+
+
+############################################################
+# 3. Helper function for resampling
+############################################################
+
+bootstrap_once <- function(fun, data) {
+  idx <- sample(seq_len(nrow(data)), replace = TRUE)
+  fun(data[idx, , drop = FALSE])
+}
+
+
+############################################################
+# 4. Constructor: makeBootstrapCI()
+#    REQUIRED name from the assignment
+############################################################
+
+makeBootstrapCI <- function(fun, data, reps = 100,
+                            level = 0.95,
+                            compute = c("serial", "parallel")) {
+
+  compute <- match.arg(compute)
+
+  # ---- Run bootstrap ----
+  if (compute == "serial") {
+
+    boots <- replicate(reps, bootstrap_once(fun, data))
+
+  } else {
+
+    cores <- detectCores()
+    cl <- makeCluster(cores)
+
+    clusterExport(cl, c("fun", "data", "bootstrap_once"),
+                  envir = environment())
+
+    boots <- unlist(parLapply(
+      cl, 1:reps,
+      function(i) bootstrap_once(fun, data)
+    ))
+
+    stopCluster(cl)
+  }
+
+  # ---- Estimate + SE ----
+  est   <- mean(boots)
+  sterr <- sd(boots)
+
+  # ---- Return the new object ----
+  new("bootstrapWaldCI",
+      est     = est,
+      sterr   = sterr,
+      level   = level,
+      fun     = fun,
+      data    = data,
+      reps    = reps,
+      compute = compute,
+      boots   = boots)
+}
+
+
+############################################################
+# 5. Method: rebootstrap()
+############################################################
+
+setGeneric("rebootstrap", function(object) standardGeneric("rebootstrap"))
+
+setMethod("rebootstrap", "bootstrapWaldCI", function(object) {
+
+  if (object@compute == "serial") {
+
+    boots <- replicate(object@reps,
+                       bootstrap_once(object@fun, object@data))
+
+  } else {
+
+    cores <- detectCores()
+    cl <- makeCluster(cores)
+
+    clusterExport(cl, c("object", "bootstrap_once"),
+                  envir = environment())
+
+    boots <- unlist(parLapply(
+      cl, 1:object@reps,
+      function(i) bootstrap_once(object@fun, object@data)
+    ))
+
+    stopCluster(cl)
+  }
+
+  # Update object slots
+  object@boots <- boots
+  object@est   <- mean(boots)
+  object@sterr <- sd(boots)
+
+  object
+})
+
+
+############################################################
+# Part (b) — Demonstration
+############################################################
+
+library(ggplot2)
+
+# Required example from assignment
+ci1 <- makeBootstrapCI(
+  function(x) mean(x$y),
+  data = ggplot2::diamonds,
+  reps = 1000
+)
+
+ci1     # show bootstrap-wald CI
+
+# Re-run bootstrap:
+rebootstrap(ci1)
+
+
+#C
+dispCoef <- function(data) {
+  fit <- lm(mpg ~ cyl + disp + wt, data = data)
+  coef(fit)[["disp"]]   # return only the coefficient on disp
+}
+
+
+ci2 <- makeBootstrapCI(
+  dispCoef,
+  mtcars,
+  reps = 1000
+)
+
+ci2
+
+
+rebootstrap(ci2)
+
+
+system.time(makeBootstrapCI(dispCoef, mtcars, reps = 2000, compute = "serial"))
+system.time(makeBootstrapCI(dispCoef, mtcars, reps = 2000, compute = "parallel"))
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
+```{r}
+set.seed(123)
+n <- 3e6
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+## 1. Demographics
+age <- pmin(pmax(rnorm(n, mean = 30, sd = 8), 16), 70)
+
+employment_status <- factor(
+  sample(c("student","full_time","part_time","unemployed"),
+         n, TRUE, prob = c(0.35,0.35,0.2,0.1))
+)
+
+country <- factor(
+  sample(c("US","India","Lithuania","Germany","Nigeria","Other"),
+         n, TRUE, prob = c(6, 5, .1, 3, .2, 10))
+)
+
+device_type <- factor(
+  sample(c("desktop","laptop","tablet","phone"),
+         n, TRUE, prob = c(0.25,0.4,0.1,0.25))
+)
+
+course_difficulty <- factor(
+  sample(c("intro","intermediate","advanced"),
+         n, TRUE, prob = c(0.5,0.3,0.2)),
+  ordered = TRUE
+)
+
+## 2. Prior GPA
+base_gpa <- 3.0 + 0.2 * (age - 30) / 10 +
+  ifelse(employment_status == "student", 0.1, 0) -
+  ifelse(employment_status == "unemployed", 0.05, 0)
+
+prior_gpa <- pmin(pmax(rnorm(n, mean = base_gpa, sd = 0.4), 0), 4)
+
+## 3. Weekly study hours
+study_mean <- 5 + ifelse(device_type %in% c("desktop","laptop"), 1.5, 0) +
+  ifelse(employment_status == "full_time", -1, 0) +
+  ifelse(employment_status == "student", 1.2, 0) +
+  ifelse(course_difficulty == "advanced", 1.5, 0) +
+  ifelse(course_difficulty == "intro", -0.5, 0)
+
+weekly_study_hours <- pmax(rnorm(n, mean = study_mean, sd = 2), 0)
+
+## 4. Engagement
+lambda_forum <- pmax(0.2 + 0.15 * weekly_study_hours + 0.5 * (prior_gpa - 3) +
+                       ifelse(course_difficulty == "advanced", 1, 0),
+                     0.05)
+
+forum_posts <- rpois(n, lambda_forum)
+
+lambda_quiz <- pmax(1 + 0.25 * weekly_study_hours + 0.8 * (prior_gpa - 2.5) +
+                      ifelse(course_difficulty == "advanced", 0.5, 0) +
+                      ifelse(course_difficulty == "intro", -0.3, 0),
+                    0.1)
+
+quiz_attempts <- rpois(n, lambda_quiz)
+
+session_minutes <- pmax(weekly_study_hours * 60 *
+                          ifelse(device_type %in% c("phone","tablet"), 0.8, 1.0) *
+                          exp(rnorm(n, 0, 0.15)),
+                        10)
+
+## 5. Paid subscription
+logit_paid <- -1.2 + 0.6 * (prior_gpa - 3) + 0.25 * (weekly_study_hours - 5) +
+  ifelse(country %in% c("US","Germany"), 0.5, 0) -
+  ifelse(country == "Nigeria", 0.4, 0)
+
+p_paid <- plogis(logit_paid)
+paid_subscription <- rbinom(n, 1, p_paid)
+
+## 6. Final score
+difficulty_penalty <- ifelse(course_difficulty=="intro", -5,
+                             ifelse(course_difficulty=="advanced", 5, 0))
+
+raw_score <- 60 + 10 * (prior_gpa - 3) + 1.5 * weekly_study_hours +
+  0.4 * forum_posts + 0.2 * quiz_attempts + difficulty_penalty + rnorm(n, 0, 8)
+
+final_score <- pmin(pmax(raw_score, 0), 100)
+
+## 7. Completion
+logit_complete <- -4 + 0.06 * final_score + 0.02 * forum_posts +
+  0.01 * quiz_attempts + 0.6 * paid_subscription -
+  0.2 * (course_difficulty == "advanced")
+
+p_complete <- plogis(logit_complete)
+completed_course <- rbinom(n, 1, p_complete)
+
+## 8. Dropout
+dropout_base <- 0.6 - 0.02 * weekly_study_hours - 0.01 * forum_posts -
+  0.01 * quiz_attempts - 0.03 * (final_score - 60) / 10 +
+  0.3 * (course_difficulty == "advanced")
+
+dropout_base <- pmin(pmax(dropout_base, 0.05), 0.95)
+early_dropout <- rbinom(n, 1, dropout_base)
+
+time_to_dropout <- rep(NA_real_, n)
+mask <- (early_dropout == 1 & completed_course == 0)
+time_to_dropout[mask] <- pmax(rgamma(sum(mask), shape = 2, rate = 0.5), 0.5)
+early_dropout[completed_course == 1] <- 0
+
+## Final dataset
+df <- data.frame(
+  age,
+  country,
+  device_type,
+  employment_status,
+  course_difficulty,
+  prior_gpa,
+  weekly_study_hours,
+  forum_posts,
+  quiz_attempts,
+  session_minutes,
+  paid_subscription,
+  final_score,
+  completed_course,
+  early_dropout,
+  time_to_dropout,
+  stringsAsFactors = FALSE
+)
+
+rm(age, country, device_type, employment_status, course_difficulty,
+   prior_gpa, weekly_study_hours, forum_posts, quiz_attempts,
+   session_minutes, paid_subscription, final_score, completed_course,
+   early_dropout, time_to_dropout, base_gpa, difficulty_penalty,
+   dropout_base, lambda_quiz, lambda_forum, logit_complete, logit_paid,
+   mask, n, p_complete, p_paid, raw_score, study_mean)
+
+cat("Data.frame `df` is", format(object.size(df), units = "MB"), "\n")
+
+
+# Modeling
+
+library(lme4)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(parallel)
+library(knitr)
+
+countries <- unique(df$country)
+data_list <- split(df, df$country)
+
+standardize_country <- function(dat) {
+  dat %>%
+    mutate(
+      prior_gpa     = scale(prior_gpa)[,1],
+      forum_posts   = scale(forum_posts)[,1],
+      quiz_attempts = scale(quiz_attempts)[,1]
+    )
+}
+
+results <- list()
+times <- numeric(length(countries))
+
+for (i in seq_along(countries)) {
+  cn <- countries[i]
+  dat <- standardize_country(data_list[[cn]])
+
+  t <- system.time({
+    fit <- glmer(
+      completed_course ~ prior_gpa + forum_posts + quiz_attempts +
+        (1 | device_type),
+      data = dat,
+      family = binomial()
+    )
+  })
+
+  times[i] <- t["elapsed"]
+
+  results[[cn]] <- list(
+    fit = fit,
+    forum_coef = fixef(fit)["forum_posts"],
+    time = t["elapsed"]
+  )
+
+  cat("Finished:", cn, "—", round(t["elapsed"], 3), "sec\n")
+}
+
+plot_df <- data.frame(
+  country = names(results),
+  forum_coef = sapply(results, function(x) x$forum_coef)
+)
+
+ggplot(plot_df, aes(x = country, y = forum_coef)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Forum Post Coefficient by Country",
+    y = "Coefficient (Standardized)"
+  ) +
+  theme_minimal()
+
+time_df <- data.frame(
+  country = countries,
+  elapsed_time = times
+)
+
+knitr::kable(time_df, digits = 3,
+             col.names = c("Country", "Time (seconds)"))
+
+
+# Detect knitting mode correctly
+is_knit <- is_html_output() || is_latex_output()
+
+
+if (is_knit) {
+
+  optimized_results <- lapply(countries, function(cn) {
+
+    dat <- standardize_country(data_list[[cn]])
+
+    t <- system.time({
+      fit <- glmer(
+        completed_course ~ prior_gpa + forum_posts + quiz_attempts +
+          (1 | device_type),
+        data = dat,
+        family = binomial()
+      )
+    })
+
+    list(
+      country = cn,
+      time = t["elapsed"],
+      forum_coef = fixef(fit)["forum_posts"]
+    )
+  })
+
+} else {
+
+  optimized_results <- mclapply(countries, function(cn) {
+
+    dat <- standardize_country(data_list[[cn]])
+
+    t <- system.time({
+      fit <- glmer(
+        completed_course ~ prior_gpa + forum_posts + quiz_attempts +
+          (1 | device_type),
+        data = dat,
+        family = binomial()
+      )
+    })
+
+    list(
+      country = cn,
+      time = t["elapsed"],
+      forum_coef = fixef(fit)["forum_posts"]
+    )
+
+  }, mc.cores = 6)
+}
+
+opt_df <- data.frame(
+  country = countries,
+  parallel_time = round(sapply(optimized_results, `[[`, "time"), 3)
+)
+
+knitr::kable(opt_df,
+             col.names = c("Country", "Parallel Time (sec)"))
+
+
 ```
-
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
